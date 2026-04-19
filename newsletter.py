@@ -77,7 +77,7 @@ def summarize_with_groq(news_text):
 (해외/빅테크 관련 뉴스)
 
 각 뉴스를 2~3줄로 요약하고, 중요도 순으로 정리해주세요.
-각 뉴스 요약 마지막 줄에 반드시 원문 링크를 포함해주세요. 형식: 🔗 링크: [URL]
+각 뉴스 요약 아랫 줄에 반드시 원문 링크를 포함해주세요. 형식: 🔗 링크: [URL]
 
 {news_text}
 """
@@ -92,8 +92,9 @@ def send_email(content):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🤖 AI 뉴스레터 {today}"
     msg["From"] = GMAIL_USER
-    msg["To"] = RECIPIENT_EMAIL
-
+    recipients = [r.strip() for r in RECIPIENT_EMAIL.split(",")]
+    msg["To"] = ", ".join(recipients)
+    
     html = f"""
     <html><body>
     <h2>🤖 오늘의 AI 뉴스레터</h2>
@@ -108,8 +109,8 @@ def send_email(content):
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-    print("이메일 전송 완료!")
+        server.sendmail(GMAIL_USER, recipients, msg.as_string())
+        print("이메일 전송 완료!")
 
 if __name__ == "__main__":
     print("뉴스 수집 중...")
