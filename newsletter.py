@@ -13,10 +13,22 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 
 def fetch_ai_news():
-    feeds = [
-        "https://news.google.com/rss/search?q=AI+인공지능&hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/search?q=ChatGPT+Claude+Gemini&hl=ko&gl=KR&ceid=KR:ko",
-    ]
+feeds = [
+# 1. 국내 전반적 AI 뉴스 (산업/트렌드 중심)
+"https://news.google.com/rss/search?q=\"국내+AI+산업\"+OR+\"한국+인공지능+트렌드\"&hl=ko&gl=KR&ceid=KR:ko",
+
+# 2. 주요 AI 모델 동향 (핵심 모델명 구체화)
+"https://news.google.com/rss/search?q=LLM+OR+GPT-5+OR+Claude+OR+Gemini+동향&hl=ko&gl=KR&ceid=KR:ko",
+
+# 3. 하드웨어/인프라 트렌드 (반도체 핵심 부품 포함)
+"https://news.google.com/rss/search?q=\"AI+반도체\"+OR+엔비디아+OR+HBM+OR+CXL&hl=ko&gl=KR&ceid=KR:ko",
+
+# 4. 기술/정책 동향
+"https://news.google.com/rss/search?q=AI+규제+OR+AI+윤리+OR+\"AI+정책\"+OR+OpenAI+OR+Anthropic&hl=ko&gl=KR&ceid=KR:ko",
+
+# 5. 글로벌 빅테크 AI 동향
+"https://news.google.com/rss/search?q=구글+AI+OR+마이크로소프트+AI+OR+메타+AI+OR+애플+AI&hl=ko&gl=KR&ceid=KR:ko",
+]
     articles = []
     for url in feeds:
         try:
