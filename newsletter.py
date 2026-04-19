@@ -1,19 +1,17 @@
 import os
 import requests
 import xml.etree.ElementTree as ET
-from groq import Groq
 import smtplib
+from groq import Groq
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 
-# 환경변수에서 키 가져오기
-GEMINI_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 
-# 뉴스 수집 (Google News RSS)
 def fetch_ai_news():
     feeds = [
         "https://news.google.com/rss/search?q=AI+인공지능&hl=ko&gl=KR&ceid=KR:ko",
@@ -33,9 +31,8 @@ def fetch_ai_news():
             print(f"뉴스 수집 오류: {e}")
     return "\n".join(articles)
 
-# Gemini로 요약
-def summarize_with_gemini(news_text):
-    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+def summarize_with_groq(news_text):
+    client = Groq(api_key=GROQ_API_KEY)
     prompt = f"""
 다음은 오늘의 AI 관련 뉴스 목록입니다.
 한국어로 읽기 좋은 뉴스레터 형식으로 요약해주세요.
@@ -49,7 +46,6 @@ def summarize_with_gemini(news_text):
     )
     return response.choices[0].message.content
 
-# 이메일 전송
 def send_email(content):
     today = datetime.now().strftime("%Y년 %m월 %d일")
     msg = MIMEMultipart("alternative")
@@ -74,11 +70,10 @@ def send_email(content):
         server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
     print("이메일 전송 완료!")
 
-# 실행
 if __name__ == "__main__":
     print("뉴스 수집 중...")
     news = fetch_ai_news()
-    print("Gemini 요약 중...")
-    summary = summarize_with_gemini(news)
+    print("Groq 요약 중...")
+    summary = summarize_with_groq(news)
     print("이메일 전송 중...")
     send_email(summary)
