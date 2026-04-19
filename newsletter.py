@@ -80,9 +80,9 @@ def summarize_with_groq(news_text):
 
 1. [뉴스 제목]
    📝 요약: 2~3줄로 핵심 내용 요약
-   🔗 링크: [URL]
    💡 쉽게 말하면: AI나 기술을 모르는 초보자도 이해할 수 있도록 쉬운 말로 2~3줄 설명
-
+   🔗 링크: [URL]
+   
 {news_text}
 """
     response = client.chat.completions.create(
