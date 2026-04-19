@@ -36,7 +36,7 @@ def fetch_ai_news():
 # Gemini로 요약
 def summarize_with_gemini(news_text):
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = f"""
 다음은 오늘의 AI 관련 뉴스 목록입니다.
 한국어로 읽기 좋은 뉴스레터 형식으로 요약해주세요.
