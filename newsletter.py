@@ -13,18 +13,27 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 
 def fetch_ai_news():
+    from datetime import timezone, timedelta
+    import email.utils
+
     feeds = [
-        # 1. 국내 전반적 AI 뉴스 (산업/트렌드 중심)
+        # 한국어 피드
         "https://news.google.com/rss/search?q=\"국내+AI+산업\"+OR+\"한국+인공지능+트렌드\"&hl=ko&gl=KR&ceid=KR:ko",
-        # 2. 주요 AI 모델 동향 (핵심 모델명 구체화)
         "https://news.google.com/rss/search?q=LLM+OR+GPT-5+OR+Claude+OR+Gemini+동향&hl=ko&gl=KR&ceid=KR:ko",
-        # 3. 하드웨어/인프라 트렌드 (반도체 핵심 부품 포함)
         "https://news.google.com/rss/search?q=\"AI+반도체\"+OR+엔비디아+OR+HBM+OR+CXL&hl=ko&gl=KR&ceid=KR:ko",
-        # 4. 기술/정책 동향
         "https://news.google.com/rss/search?q=AI+규제+OR+AI+윤리+OR+\"AI+정책\"+OR+OpenAI+OR+Anthropic&hl=ko&gl=KR&ceid=KR:ko",
-        # 5. 글로벌 빅테크 AI 동향
         "https://news.google.com/rss/search?q=구글+AI+OR+마이크로소프트+AI+OR+메타+AI+OR+애플+AI&hl=ko&gl=KR&ceid=KR:ko",
+        # 영어 피드
+        "https://news.google.com/rss/search?q=AI+latest+trends&hl=en&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=LLM+GPT+Claude+Gemini&hl=en&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=AI+semiconductor+NVIDIA+HBM&hl=en&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=AI+regulation+ethics+policy&hl=en&gl=US&ceid=US:en",
     ]
+
+    # 월요일이면 72시간, 나머지는 24시간
+    now = datetime.now(timezone.utc)
+    hours = 72 if now.weekday() == 0 else 24
+    cutoff = now - timedelta(hours=hours)
 
     articles = []
     for url in feeds:
@@ -35,16 +44,38 @@ def fetch_ai_news():
                 title = item.findtext("title", "")
                 link = item.findtext("link", "")
                 pub_date = item.findtext("pubDate", "")
+                # 날짜 필터링
+                if pub_date:
+                    try:
+                        parsed_date = email.utils.parsedate_to_datetime(pub_date)
+                        if parsed_date < cutoff:
+                            continue  # 오래된 기사 제외
+                    except:
+                        pass
                 articles.append(f"- {title} ({pub_date})\n  {link}")
         except Exception as e:
             print(f"뉴스 수집 오류: {e}")
+
+    print(f"총 {len(articles)}개 기사 수집됨")
     return "\n".join(articles)
 
 def summarize_with_groq(news_text):
     client = Groq(api_key=GROQ_API_KEY)
     prompt = f"""
 다음은 오늘의 AI 관련 뉴스 목록입니다.
-한국어로 읽기 좋은 뉴스레터 형식으로 요약해주세요.
+읽기 좋은 뉴스레터 형식으로 요약해주세요.
+만약 외국어 뉴스라면 한국어로 자연스럽게 번역해주세요.
+아래 형식으로 작성해주세요:
+
+### 🔥 주요 뉴스
+(가장 중요한 뉴스 3개)
+
+### 📌 기술 동향
+(기술/연구 관련 뉴스)
+
+### 🌐 글로벌 동향
+(해외/빅테크 관련 뉴스)
+
 각 뉴스를 2~3줄로 요약하고, 중요도 순으로 정리해주세요.
 각 뉴스 요약 마지막 줄에 반드시 원문 링크를 포함해주세요. 형식: 🔗 링크: [URL]
 
