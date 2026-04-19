@@ -1,8 +1,7 @@
 import os
 import requests
 import xml.etree.ElementTree as ET
-import google.generativeai as genai
-import smtplib
+from groq import Groqimport smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -35,8 +34,7 @@ def fetch_ai_news():
 
 # Gemini로 요약
 def summarize_with_gemini(news_text):
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
     prompt = f"""
 다음은 오늘의 AI 관련 뉴스 목록입니다.
 한국어로 읽기 좋은 뉴스레터 형식으로 요약해주세요.
@@ -44,8 +42,11 @@ def summarize_with_gemini(news_text):
 
 {news_text}
 """
-    response = model.generate_content(prompt)
-    return response.text
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
 
 # 이메일 전송
 def send_email(content):
