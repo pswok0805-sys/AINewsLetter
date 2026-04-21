@@ -1,8 +1,6 @@
 name: AI Newsletter
 
 on:
-  schedule:
-    - cron: '0 0 * * 1-5'  # 한국시간 매일 평일 9시 (UTC 0시)
   workflow_dispatch:         # 수동 실행 버튼도 생김
 
 jobs:
