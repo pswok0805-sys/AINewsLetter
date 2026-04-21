@@ -6,16 +6,25 @@ from groq import Groq
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
+from difflib import SequenceMatcher
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 
-def fetch_ai_news():
-    from datetime import timezone, timedelta
-    import email.utils
+from difflib import SequenceMatcher
+from datetime import timezone, timedelta
+import email.utils
 
+def is_duplicate(title, existing_titles, threshold=0.8):
+    for existing in existing_titles:
+        ratio = SequenceMatcher(None, title, existing).ratio()
+        if ratio >= threshold:
+            return True
+    return False
+
+def fetch_ai_news():
     feeds = [
         # 한국어 피드
         "https://news.google.com/rss/search?q=\"국내+AI+산업\"+OR+\"한국+인공지능+트렌드\"&hl=ko&gl=KR&ceid=KR:ko",
@@ -30,12 +39,13 @@ def fetch_ai_news():
         "https://news.google.com/rss/search?q=AI+regulation+ethics+policy&hl=en&gl=US&ceid=US:en",
     ]
 
-    # 월요일이면 72시간, 나머지는 24시간
     now = datetime.now(timezone.utc)
     hours = 72 if now.weekday() == 0 else 24
     cutoff = now - timedelta(hours=hours)
 
+    seen_titles = []  # ← 중복 체크용
     articles = []
+
     for url in feeds:
         try:
             res = requests.get(url, timeout=10)
@@ -44,15 +54,23 @@ def fetch_ai_news():
                 title = item.findtext("title", "")
                 link = item.findtext("link", "")
                 pub_date = item.findtext("pubDate", "")
+
                 # 날짜 필터링
                 if pub_date:
                     try:
                         parsed_date = email.utils.parsedate_to_datetime(pub_date)
                         if parsed_date < cutoff:
-                            continue  # 오래된 기사 제외
+                            continue
                     except:
                         pass
+
+                # 중복 필터링 ← 여기가 핵심
+                if is_duplicate(title, seen_titles):
+                    continue
+
+                seen_titles.append(title)
                 articles.append(f"- {title} ({pub_date})\n  {link}")
+
         except Exception as e:
             print(f"뉴스 수집 오류: {e}")
 
