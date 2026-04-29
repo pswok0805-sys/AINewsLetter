@@ -121,12 +121,17 @@ def summarize_with_groq(news_text):
     )
     result = response.choices[0].message.content
     
-    # 한자 감지 시 재요청
-    if has_chinese(result):
-        print("한자 감지됨 → 재요청 중...")
+# 한자 감지 시 최대 3번 재요청
+    max_retries = 3
+    retry_count = 0
+    
+    while has_chinese(result) and retry_count < max_retries:
+        retry_count += 1
+        print(f"한자 감지됨 → 재요청 중... ({retry_count}/{max_retries})")
         fix_prompt = f"""
 아래 텍스트에 한자가 포함되어 있습니다.
 한자를 모두 한국어로 바꿔서 전체 텍스트를 다시 작성해주세요.
+예: 更加 → 더욱, 韓 → 한국, 部門 → 부문
 다른 내용은 절대 바꾸지 마세요.
 
 {result}
