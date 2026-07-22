@@ -61,8 +61,14 @@ def decode_google_news_link(link: str) -> str:
     return link
 
 
-def fetch_ai_news():
-    """구글 뉴스 RSS에서 AI 관련 기사 수집"""
+MAX_ARTICLES = 12
+
+
+def fetch_ai_news() -> list[dict]:
+    """구글 뉴스 RSS에서 AI 관련 기사 수집.
+    각 기사를 {id, title, source, link} 딕셔너리로 반환한다.
+    링크(구글 리다이렉트 URL)는 매우 길어 LLM 프롬프트 토큰을 크게 잡아먹으므로
+    LLM에게는 넘기지 않고, id로만 나중에 매칭한다."""
     feeds = [
         "https://news.google.com/rss/search?q=\"국내+AI+산업\"+OR+\"한국+인공지능+트렌드\"&hl=ko&gl=KR&ceid=KR:ko",
         "https://news.google.com/rss/search?q=LLM+OR+GPT-5+OR+Claude+OR+Gemini+동향&hl=ko&gl=KR&ceid=KR:ko",
@@ -104,13 +110,21 @@ def fetch_ai_news():
                     continue
                 seen_titles.append(title)
 
-                source_tag = f"[{source}] " if source else ""
-                articles.append(f"- {source_tag}{title} ({pub_date})\n  {link}")
+                articles.append({
+                    "id": len(articles) + 1,
+                    "title": title,
+                    "source": source,
+                    "link": link,
+                })
         except Exception as e:
             print(f"뉴스 수집 오류: {e}")
 
+    if len(articles) > MAX_ARTICLES:
+        print(f"⚠️ 수집 기사 {len(articles)}개 → 상한 {MAX_ARTICLES}개로 제한")
+        articles = articles[:MAX_ARTICLES]
+
     print(f"총 {len(articles)}개 기사 수집됨")
-    return "\n".join(articles)
+    return articles
 
 
 # ─────────────────────────────────────────────
@@ -205,15 +219,16 @@ SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
 
 [출력 형식 - 절대 규칙]
 - 아래 JSON 스키마 외의 텍스트(설명, 코드블록 표시 등)는 절대 출력하지 않습니다. 순수 JSON 객체 하나만 출력합니다.
+- 원문 각 기사에는 id 번호가 붙어 있습니다. 링크(URL)는 절대 직접 작성하지 말고, 해당 기사의 id 번호만 정확히 그대로 적습니다.
 
 {
-  "main": [ {"title": "...", "summary": "...", "insight": "...", "link": "..."} ],
-  "tech": [ {"title": "...", "summary": "...", "insight": "...", "link": "..."} ],
-  "global": [ {"title": "...", "summary": "...", "insight": "...", "link": "..."} ]
+  "main": [ {"id": 0, "title": "...", "summary": "...", "insight": "..."} ],
+  "tech": [ {"id": 0, "title": "...", "summary": "...", "insight": "..."} ],
+  "global": [ {"id": 0, "title": "...", "summary": "...", "insight": "..."} ]
 }
 
 - main은 최대 3개, 나머지는 원문 기사 수에 맞춰 tech/global에 배분합니다(전체 합계는 원문 기사 수 이상 줄이지 않습니다).
-- link는 원문에 주어진 URL을 그대로 사용합니다."""
+- 두 기사를 병합한 경우 id는 그중 더 정보가 풍부한 기사 하나의 id를 사용합니다."""
 
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -228,7 +243,7 @@ def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mod
             {"role": "user", "content": user},
         ],
         temperature=temperature,
-        max_tokens=8192,
+        max_tokens=4096,
         top_p=0.9,
     )
     if json_mode:
@@ -246,16 +261,21 @@ def _extract_json_object(text: str) -> str:
     return text[start:end + 1]
 
 
-def summarize_with_groq(news_text: str) -> dict:
-    """뉴스 요약 - 검증/재시도/강제치환 3중 안전장치 + JSON 구조화 출력"""
+def summarize_with_groq(articles: list[dict]) -> dict:
+    """뉴스 요약 - 검증/재시도/강제치환 3중 안전장치 + JSON 구조화 출력.
+    링크는 프롬프트에 넣지 않고 id로만 참조시켜 토큰(TPM) 사용량을 줄인다."""
     client = Groq(api_key=GROQ_API_KEY)
 
-    article_count = news_text.count("\n- ") + (1 if news_text.startswith("- ") else 0)
+    article_count = len(articles)
+    news_lines = "\n".join(
+        f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
+        for a in articles
+    )
     user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다. 총 {article_count}개 기사가 있습니다.
 지정된 JSON 형식으로만 응답하세요. main+tech+global 합계는 {article_count}개(동일 사건 병합 제외 시) 이상이어야 합니다.
 
 [뉴스 원문]
-{news_text}
+{news_lines}
 """
 
     result = call_groq(client, SYSTEM_PROMPT, user_prompt, temperature=0.2, json_mode=True)
@@ -277,7 +297,7 @@ def summarize_with_groq(news_text: str) -> dict:
 人工知能 → 인공지능,  半導體 → 반도체,  企業 → 기업,  産業 → 산업
 更加 → 더욱,  開發 → 개발,  發表 → 발표,  硏究 → 연구
 
-JSON 키(title/summary/link)와 구조는 그대로 유지하고, 문자열 값 안의 외국 문자만 한글로 바꾸세요.
+JSON 키(id/title/summary/insight)와 구조는 그대로 유지하고, 문자열 값 안의 외국 문자만 한글로 바꾸세요.
 
 [원문]
 {result}
@@ -298,12 +318,17 @@ JSON 키(title/summary/link)와 구조는 그대로 유지하고, 문자열 값 
     for key, _, _ in CATEGORY_META:
         data.setdefault(key, [])
 
+    link_by_id = {a["id"]: a["link"] for a in articles}
+    for key, _, _ in CATEGORY_META:
+        for item in data[key]:
+            item["link"] = link_by_id.get(item.get("id"), "")
+
     return dedupe_across_categories(data)
 
 
 def decode_links_in_categories(categories: dict) -> dict:
     """최종 게재 대상 기사(보통 10개 이하)에 한해 구글 뉴스 링크를 원문 URL로 디코딩.
-    전체 수집 단계(최대 45개)에서 디코딩하면 무료 API 호출량이 과도해지므로
+    전체 수집 단계(최대 12개)에서 디코딩하면 무료 API 호출량이 과도해지므로
     요약·중복 제거가 끝난 뒤 이 시점에만 수행한다."""
     for key, _, _ in CATEGORY_META:
         for article in categories.get(key, []):
@@ -378,12 +403,32 @@ def send_email(categories: dict):
     print("이메일 전송 완료!")
 
 
+def send_failure_notice(error: Exception):
+    """파이프라인 실패 시에도 받는사람이 상태를 알 수 있도록 최소 안내 메일 발송"""
+    today = datetime.now().strftime("%Y년 %m월 %d일")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"⚠️ AI 뉴스레터 생성 실패 {today}"
+    msg["From"] = GMAIL_USER
+    recipients = [r.strip() for r in RECIPIENT_EMAIL.split(",")]
+    msg["To"] = ", ".join(recipients)
+    body = f"오늘({today}) 뉴스레터 생성 중 오류가 발생해 발송하지 못했습니다.\n\n오류 내용: {error}"
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, recipients, msg.as_string())
+
+
 if __name__ == "__main__":
-    print("뉴스 수집 중...")
-    news = fetch_ai_news()
-    print("Groq 요약 중...")
-    summary = summarize_with_groq(news)
-    print("원문 링크 디코딩 중...")
-    summary = decode_links_in_categories(summary)
-    print("이메일 전송 중...")
-    send_email(summary)
+    try:
+        print("뉴스 수집 중...")
+        news = fetch_ai_news()
+        print("Groq 요약 중...")
+        summary = summarize_with_groq(news)
+        print("원문 링크 디코딩 중...")
+        summary = decode_links_in_categories(summary)
+        print("이메일 전송 중...")
+        send_email(summary)
+    except Exception as e:
+        print(f"❌ 파이프라인 실패: {e}")
+        send_failure_notice(e)
+        raise
