@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import html
 import requests
 import xml.etree.ElementTree as ET
 import smtplib
@@ -9,16 +11,14 @@ from difflib import SequenceMatcher
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from groq import Groq
+from googlenewsdecoder import gnewsdecoder
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 
-# ─────────────────────────────────────────────
-# [수정 1] 자주 출현하는 한자→한글 매핑 테이블
-# Llama 모델이 자주 삽입하는 한자를 사전에 등록
-# ─────────────────────────────────────────────
+# 자주 출현하는 한자→한글 매핑 (Llama 모델이 자주 삽입하는 한자를 사전에 등록)
 HANJA_MAP = {
     "韓國": "한국", "韓": "한국", "美國": "미국", "美": "미국",
     "中國": "중국", "中": "중국", "日本": "일본", "日": "일본",
@@ -32,13 +32,33 @@ HANJA_MAP = {
     "報告": "보고", "豫想": "예상", "現在": "현재", "今後": "향후",
 }
 
+# (카테고리 키, 표시 라벨, 강조색) - 순서가 곧 중복 제거 우선순위(main > tech > global)
+CATEGORY_META = [
+    ("main", "🔥 주요 뉴스", "#dc2626"),
+    ("tech", "📌 기술 동향", "#2563eb"),
+    ("global", "🌐 글로벌 동향", "#16a34a"),
+]
+
+
 def is_duplicate(title, existing_titles, threshold=0.8):
-    """제목 유사도 기반 중복 제거"""
+    """제목 유사도 기반 중복 제거 (수집 단계, 원문 제목 기준)"""
     for existing in existing_titles:
         ratio = SequenceMatcher(None, title, existing).ratio()
         if ratio >= threshold:
             return True
     return False
+
+
+def decode_google_news_link(link: str) -> str:
+    """구글 뉴스 리다이렉트 링크를 실제 언론사 원문 URL로 디코딩.
+    실패 시(429, 타임아웃 등) 원본 링크를 그대로 반환한다."""
+    try:
+        result = gnewsdecoder(link)
+        if result.get("status") and result.get("decoded_url"):
+            return result["decoded_url"]
+    except Exception:
+        pass
+    return link
 
 
 def fetch_ai_news():
@@ -70,6 +90,7 @@ def fetch_ai_news():
                 title = item.findtext("title", "")
                 link = item.findtext("link", "")
                 pub_date = item.findtext("pubDate", "")
+                source = item.findtext("source", "") or ""
 
                 if pub_date:
                     try:
@@ -82,7 +103,9 @@ def fetch_ai_news():
                 if is_duplicate(title, seen_titles):
                     continue
                 seen_titles.append(title)
-                articles.append(f"- {title} ({pub_date})\n  {link}")
+
+                source_tag = f"[{source}] " if source else ""
+                articles.append(f"- {source_tag}{title} ({pub_date})\n  {link}")
         except Exception as e:
             print(f"뉴스 수집 오류: {e}")
 
@@ -91,16 +114,16 @@ def fetch_ai_news():
 
 
 # ─────────────────────────────────────────────
-# [수정 2] 출력 품질 검증 함수 (다층 검사)
+# 출력 품질 검증 (한자/가나 감지, 한글 비율)
 # ─────────────────────────────────────────────
 def has_chinese(text: str) -> bool:
     """한자(중국어/일본어 한자) 감지"""
-    return bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+    return bool(re.search(r'[一-鿿㐀-䶿]', text))
 
 
 def has_japanese_kana(text: str) -> bool:
     """일본어 가나 감지 (히라가나, 가타카나)"""
-    return bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text))
+    return bool(re.search(r'[぀-ゟ゠-ヿ]', text))
 
 
 def korean_ratio(text: str) -> float:
@@ -108,11 +131,7 @@ def korean_ratio(text: str) -> float:
     cleaned = re.sub(r'[\s\d\W_]+', '', text, flags=re.UNICODE)
     if not cleaned:
         return 1.0
-    korean_chars = re.findall(r'[\uac00-\ud7af]', cleaned)
-    english_chars = re.findall(r'[a-zA-Z]', cleaned)
-    total_meaningful = len(korean_chars) + len(english_chars)
-    if total_meaningful == 0:
-        return 0.0
+    korean_chars = re.findall(r'[가-힯]', cleaned)
     return len(korean_chars) / len(cleaned)
 
 
@@ -128,80 +147,109 @@ def is_output_valid(text: str) -> tuple[bool, str]:
 
 
 def force_replace_hanja(text: str) -> str:
-    """[수정 3] 사전 매핑된 한자는 강제 치환 (최후 안전장치)"""
+    """사전 매핑된 한자는 강제 치환 (최후 안전장치)"""
     for hanja, hangul in HANJA_MAP.items():
         text = text.replace(hanja, hangul)
-    # 그래도 남은 한자는 [?]로 표시 (메일 가독성 보호)
-    text = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf]', '', text)
+    text = re.sub(r'[一-鿿㐀-䶿]', '', text)
     return text
 
 
 # ─────────────────────────────────────────────
-# [수정 4] LLM 호출 - system 프롬프트 분리 + 파라미터 명시
+# 카테고리 간 중복 기사 제거 (동일 사건이 다른 표현의 제목으로
+# 여러 섹션에 배치되는 경우, 제목 문자열 자체가 다르면 fetch 단계의
+# SequenceMatcher로는 못 걸러지므로 토큰(단어) 유사도로 한 번 더 걸러낸다)
 # ─────────────────────────────────────────────
-SYSTEM_PROMPT = """당신은 한국어 뉴스레터 에디터입니다.
+def _tokenize(title: str) -> set:
+    return set(re.findall(r'[가-힣a-zA-Z0-9]+', title))
 
-[절대 규칙]
+
+def dedupe_across_categories(categories: dict, threshold: float = 0.4) -> dict:
+    """우선순위(main > tech > global)가 높은 카테고리에 이미 실린 사건은 이후 카테고리에서 제외"""
+    kept_tokens = []
+    result = {key: [] for key, _, _ in CATEGORY_META}
+    for key, _, _ in CATEGORY_META:
+        for article in categories.get(key, []):
+            tokens = _tokenize(article.get("title", ""))
+            is_dup = any(
+                tokens and kt and len(tokens & kt) / len(tokens | kt) >= threshold
+                for kt in kept_tokens
+            )
+            if is_dup:
+                continue
+            kept_tokens.append(tokens)
+            result[key].append(article)
+    return result
+
+
+SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
+
+[절대 규칙 - 언어]
 - 출력은 100% 한국어(한글)로만 작성합니다.
-- 한자(漢字), 중국어 간체, 번체, 일본어 가나는 단 한 글자도 사용 금지입니다.
+- 한자(漢字), 중국어 간체/번체, 일본어 가나는 단 한 글자도 사용 금지입니다.
 - 영문 고유명사(OpenAI, NVIDIA 등)와 숫자는 그대로 사용 가능합니다.
 - 한자어는 반드시 한글 음으로 표기합니다. 예: 韓國 → 한국, 開發 → 개발, 産業 → 산업
 
-[위반 시 결과]
-- 한자가 한 글자라도 포함되면 응답은 즉시 폐기됩니다.
+[절대 규칙 - 편집]
+- 같은 사건을 다루는 기사가 여러 개 있으면 반드시 하나의 항목으로 병합하고, 가장 정보가 풍부한 링크 하나만 사용합니다.
+- "주요 뉴스"는 게재 순서가 아니라 산업/기술적 파급력, 독점성, 최초성을 기준으로 직접 판단해 선정합니다. 단순 보도자료성 뉴스(윤리 헌장 제정 등)는 실질적 파급력이 없으면 주요 뉴스에서 제외합니다.
+- 요약에는 다음과 같은 상투적 문구를 사용하지 않습니다: "~에 큰 영향을 미칠 수 있습니다", "~에 영향을 미칠 것으로 보입니다", "주목할 만합니다", "관심이 집중되고 있습니다".
+- 대신 각 요약의 마지막 문장에는 구체적인 수치, 일정, 경쟁사 비교, 시장 규모 중 최소 1가지를 근거로 포함합니다.
 
-[출력 형식]
-지정된 마크다운 형식을 정확히 따릅니다."""
+[출력 형식 - 절대 규칙]
+- 아래 JSON 스키마 외의 텍스트(설명, 코드블록 표시 등)는 절대 출력하지 않습니다. 순수 JSON 객체 하나만 출력합니다.
+
+{
+  "main": [ {"title": "...", "summary": "...", "link": "..."} ],
+  "tech": [ {"title": "...", "summary": "...", "link": "..."} ],
+  "global": [ {"title": "...", "summary": "...", "link": "..."} ]
+}
+
+- main은 최대 3개, summary는 초보자도 이해할 수 있도록 3~4문장으로 작성합니다.
+- link는 원문에 주어진 URL을 그대로 사용합니다."""
 
 
-def call_groq(client, system: str, user: str, temperature: float = 0.2) -> str:
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+
+def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mode: bool = False) -> str:
     """Groq API 호출 래퍼 - 일관된 파라미터 적용"""
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+    kwargs = dict(
+        model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=temperature,   # [핵심] 낮은 temperature로 안정성 확보
+        temperature=temperature,
         max_tokens=4096,
         top_p=0.9,
     )
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
 
-def summarize_with_groq(news_text: str) -> str:
-    """뉴스 요약 - 검증/재시도/강제치환 3중 안전장치"""
+def _extract_json_object(text: str) -> str:
+    """모델이 코드블록 등 부가 텍스트를 덧붙인 경우를 대비해 최외곽 JSON 객체만 추출"""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        return text
+    return text[start:end + 1]
+
+
+def summarize_with_groq(news_text: str) -> dict:
+    """뉴스 요약 - 검증/재시도/강제치환 3중 안전장치 + JSON 구조화 출력"""
     client = Groq(api_key=GROQ_API_KEY)
 
-    user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다.
-읽기 좋은 뉴스레터 형식으로 한국어로 요약해 주세요.
-외국어 뉴스는 자연스러운 한국어로 번역해 주세요.
-
-[형식]
-### 🔥 주요 뉴스
-(가장 중요한 뉴스 3개)
-
-### 📌 기술 동향
-(기술/연구 관련 뉴스)
-
-### 🌐 글로벌 동향
-(해외/빅테크 관련 뉴스)
-
-각 뉴스 항목 형식:
-1. [뉴스 제목]
-   📝 요약 및 해석: 핵심 내용을 초보자도 이해할 수 있게 3~4줄로 설명. 왜 중요한지, 어떤 영향이 있을지 포함.
-   🔗 링크: [URL]
-
-(뉴스 사이에는 빈 줄 한 줄)
+    user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다. 지정된 JSON 형식으로만 응답하세요.
 
 [뉴스 원문]
 {news_text}
 """
 
-    # 1차 호출
-    result = call_groq(client, SYSTEM_PROMPT, user_prompt, temperature=0.2)
+    result = call_groq(client, SYSTEM_PROMPT, user_prompt, temperature=0.2, json_mode=True)
 
-    # 검증 및 재시도 (최대 3회, 단계별로 더 강하게)
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         valid, reason = is_output_valid(result)
@@ -211,33 +259,92 @@ def summarize_with_groq(news_text: str) -> str:
 
         print(f"⚠️ 출력 검증 실패 ({reason}) → 재요청 {attempt}/{max_retries}")
 
-        # [수정 5] 재요청 프롬프트에 구체적 예시 포함
-        fix_prompt = f"""아래 텍스트에는 한자 또는 일본어가 포함되어 있어 사용할 수 없습니다.
-모든 외국 문자를 한국어 한글로 바꿔서 전체 텍스트를 다시 출력하세요.
+        fix_prompt = f"""아래 JSON에는 한자 또는 일본어가 포함되어 있어 사용할 수 없습니다.
+모든 외국 문자를 한국어 한글로 바꿔서 동일한 JSON 구조로 다시 출력하세요.
 
 [변환 예시]
 韓國 → 한국,  美國 → 미국,  中國 → 중국,  日本 → 일본
 人工知能 → 인공지능,  半導體 → 반도체,  企業 → 기업,  産業 → 산업
 更加 → 더욱,  開發 → 개발,  發表 → 발표,  硏究 → 연구
 
-내용과 형식은 그대로 유지하되, 외국 문자만 한글로 바꿔서 다시 작성하세요.
+JSON 키(title/summary/link)와 구조는 그대로 유지하고, 문자열 값 안의 외국 문자만 한글로 바꾸세요.
 
 [원문]
 {result}
 """
-        # 재시도 시 temperature를 더 낮춤
-        result = call_groq(client, SYSTEM_PROMPT, fix_prompt, temperature=0.1)
+        result = call_groq(client, SYSTEM_PROMPT, fix_prompt, temperature=0.1, json_mode=True)
 
-    # [수정 6] 최종 안전장치: 그래도 한자가 남았으면 강제 치환
     valid, reason = is_output_valid(result)
     if not valid:
         print(f"⛑️ 재시도 모두 실패 → 강제 치환 적용 ({reason})")
         result = force_replace_hanja(result)
 
-    return result
+    try:
+        data = json.loads(_extract_json_object(result))
+    except json.JSONDecodeError as e:
+        print(f"⚠️ JSON 파싱 실패, 빈 뉴스레터로 대체: {e}")
+        data = {}
+
+    for key, _, _ in CATEGORY_META:
+        data.setdefault(key, [])
+
+    return dedupe_across_categories(data)
 
 
-def send_email(content: str):
+def decode_links_in_categories(categories: dict) -> dict:
+    """최종 게재 대상 기사(보통 10개 이하)에 한해 구글 뉴스 링크를 원문 URL로 디코딩.
+    전체 수집 단계(최대 45개)에서 디코딩하면 무료 API 호출량이 과도해지므로
+    요약·중복 제거가 끝난 뒤 이 시점에만 수행한다."""
+    for key, _, _ in CATEGORY_META:
+        for article in categories.get(key, []):
+            article["link"] = decode_google_news_link(article.get("link", ""))
+    return categories
+
+
+def build_email_html(categories: dict, today: str) -> str:
+    """카테고리별 카드 레이아웃 HTML 생성"""
+    section_html = ""
+    for key, label, color in CATEGORY_META:
+        articles = categories.get(key, [])
+        if not articles:
+            continue
+
+        section_html += f"""
+        <tr><td style="background:{color}; color:#ffffff; font-size:16px; font-weight:700; padding:12px 20px;">{html.escape(label)}</td></tr>
+        """
+        for i, article in enumerate(articles, 1):
+            title = html.escape(article.get("title", ""))
+            summary = html.escape(article.get("summary", ""))
+            link = html.escape(article.get("link", "#"), quote=True)
+            section_html += f"""
+        <tr><td style="padding:16px 20px; border-bottom:1px solid #eeeeee;">
+          <div style="font-size:15px; font-weight:600; color:#111111; margin-bottom:6px;">{i}. {title}</div>
+          <div style="font-size:13px; color:#444444; line-height:1.6; margin-bottom:10px;">{summary}</div>
+          <a href="{link}" style="display:inline-block; font-size:12px; color:#ffffff; background:{color}; padding:6px 14px; border-radius:4px; text-decoration:none;">기사 보기 →</a>
+        </td></tr>
+            """
+
+    return f"""
+    <html>
+    <body style="margin:0; padding:0; background:#f4f4f4;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4; padding:24px 0;">
+        <tr><td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:8px; overflow:hidden; font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;">
+            <tr><td style="background:#111111; color:#ffffff; padding:24px 20px;">
+              <div style="font-size:20px; font-weight:700;">🤖 오늘의 AI 뉴스레터</div>
+              <div style="font-size:13px; color:#cccccc; margin-top:4px;">{today}</div>
+            </td></tr>
+            {section_html}
+            <tr><td style="padding:16px 20px; color:#999999; font-size:11px; text-align:center;">자동 발송된 뉴스레터입니다.</td></tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
+    """
+
+
+def send_email(categories: dict):
     """Gmail SMTP로 뉴스레터 발송"""
     today = datetime.now().strftime("%Y년 %m월 %d일")
     msg = MIMEMultipart("alternative")
@@ -247,17 +354,7 @@ def send_email(content: str):
     recipients = [r.strip() for r in RECIPIENT_EMAIL.split(",")]
     msg["To"] = ", ".join(recipients)
 
-    html = f"""
-    <html><body>
-      <h2>🤖 오늘의 AI 뉴스레터</h2>
-      <p>{today}</p>
-      <hr>
-      <pre style="font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif; white-space:pre-wrap; line-height:1.6;">{content}</pre>
-      <hr>
-      <p style="color:gray; font-size:12px;">자동 발송된 뉴스레터입니다.</p>
-    </body></html>
-    """
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(build_email_html(categories, today), "html"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
@@ -270,5 +367,7 @@ if __name__ == "__main__":
     news = fetch_ai_news()
     print("Groq 요약 중...")
     summary = summarize_with_groq(news)
+    print("원문 링크 디코딩 중...")
+    summary = decode_links_in_categories(summary)
     print("이메일 전송 중...")
     send_email(summary)
