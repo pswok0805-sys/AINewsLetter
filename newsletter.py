@@ -163,15 +163,19 @@ def _tokenize(title: str) -> set:
     return set(re.findall(r'[가-힣a-zA-Z0-9]+', title))
 
 
-def dedupe_across_categories(categories: dict, threshold: float = 0.4) -> dict:
-    """우선순위(main > tech > global)가 높은 카테고리에 이미 실린 사건은 이후 카테고리에서 제외"""
+def dedupe_across_categories(categories: dict, threshold: float = 0.6, min_overlap: int = 2) -> dict:
+    """우선순위(main > tech > global)가 높은 카테고리에 이미 실린 사건은 이후 카테고리에서 제외.
+    "AI", "인공지능" 같은 공통 단어 한두 개만 겹쳐도 중복으로 오판하지 않도록
+    Jaccard 임계값(0.6)과 최소 겹치는 단어 수(2개) 조건을 함께 요구한다."""
     kept_tokens = []
     result = {key: [] for key, _, _ in CATEGORY_META}
     for key, _, _ in CATEGORY_META:
         for article in categories.get(key, []):
             tokens = _tokenize(article.get("title", ""))
             is_dup = any(
-                tokens and kt and len(tokens & kt) / len(tokens | kt) >= threshold
+                tokens and kt
+                and len(tokens & kt) >= min_overlap
+                and len(tokens & kt) / len(tokens | kt) >= threshold
                 for kt in kept_tokens
             )
             if is_dup:
@@ -190,25 +194,29 @@ SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
 - 한자어는 반드시 한글 음으로 표기합니다. 예: 韓國 → 한국, 開發 → 개발, 産業 → 산업
 
 [절대 규칙 - 편집]
-- 같은 사건을 다루는 기사가 여러 개 있으면 반드시 하나의 항목으로 병합하고, 가장 정보가 풍부한 링크 하나만 사용합니다.
-- "주요 뉴스"는 게재 순서가 아니라 산업/기술적 파급력, 독점성, 최초성을 기준으로 직접 판단해 선정합니다. 단순 보도자료성 뉴스(윤리 헌장 제정 등)는 실질적 파급력이 없으면 주요 뉴스에서 제외합니다.
+- "병합"은 두 기사가 완전히 동일한 사건(예: 같은 회사의 같은 발표, 같은 날 같은 계약)을 다른 매체가 보도한 경우에만 적용합니다. 같은 산업/주제(예: "AI 반도체")를 다루더라도 회사·발표·사건이 다르면 절대 병합하지 말고 각각 별도 항목으로 유지합니다. 예를 들어 "AMD의 HBM4 채택" 기사와 "구글의 자체 AI 칩 개발" 기사는 둘 다 반도체 관련이지만 서로 다른 사건이므로 반드시 별도 항목입니다.
+- [뉴스 원문]에 있는 기사 수가 9개 이상이면, 최종 출력(main+tech+global 합계)도 반드시 9개 이상을 포함해야 합니다. 기사 수가 9개 미만이면 원문에 있는 기사 수만큼 전부 포함합니다. 병합은 정말로 동일 사건일 때만 예외적으로 적용하고, 임의로 기사 수를 줄이지 않습니다.
+- "주요 뉴스"는 게재 순서가 아니라 산업/기술적 파급력, 독점성, 최초성을 기준으로 직접 판단해 선정합니다. 단순 보도자료성 뉴스(윤리 헌장 제정 등)는 실질적 파급력이 없으면 주요 뉴스에서 제외하되, tech 또는 global 섹션으로는 반드시 포함시킵니다.
 - 요약에는 다음과 같은 상투적 문구를 사용하지 않습니다: "~에 큰 영향을 미칠 수 있습니다", "~에 영향을 미칠 것으로 보입니다", "주목할 만합니다", "관심이 집중되고 있습니다".
-- 대신 각 요약의 마지막 문장에는 구체적인 수치, 일정, 경쟁사 비교, 시장 규모 중 최소 1가지를 근거로 포함합니다.
+
+[요약 구성 - summary와 insight를 반드시 구분]
+- summary: 기사의 핵심 사실만 3~4문장으로 설명합니다. 누가, 무엇을, 언제, 얼마나(수치/일정)를 포함한 사실 위주 설명이며 해석은 넣지 않습니다.
+- insight: 이 뉴스를 읽는 독자가 생각해봐야 할 함의를 3~4문장으로 씁니다. 다음 중 최소 2가지를 포함합니다: (1) 이 사건이 경쟁사/업계 구도를 어떻게 바꾸는지 구체적 비교, (2) 왜 지금 이 시점에 일어났는지 배경, (3) 단기(수개월)와 중장기(1~2년) 전망의 차이, (4) 독자(개발자/투자자/일반 소비자 등)에게 실질적으로 달라지는 점. insight는 summary의 문장을 재진술하지 않고 반드시 새로운 관점을 추가합니다.
 
 [출력 형식 - 절대 규칙]
 - 아래 JSON 스키마 외의 텍스트(설명, 코드블록 표시 등)는 절대 출력하지 않습니다. 순수 JSON 객체 하나만 출력합니다.
 
 {
-  "main": [ {"title": "...", "summary": "...", "link": "..."} ],
-  "tech": [ {"title": "...", "summary": "...", "link": "..."} ],
-  "global": [ {"title": "...", "summary": "...", "link": "..."} ]
+  "main": [ {"title": "...", "summary": "...", "insight": "...", "link": "..."} ],
+  "tech": [ {"title": "...", "summary": "...", "insight": "...", "link": "..."} ],
+  "global": [ {"title": "...", "summary": "...", "insight": "...", "link": "..."} ]
 }
 
-- main은 최대 3개, summary는 초보자도 이해할 수 있도록 3~4문장으로 작성합니다.
+- main은 최대 3개, 나머지는 원문 기사 수에 맞춰 tech/global에 배분합니다(전체 합계는 원문 기사 수 이상 줄이지 않습니다).
 - link는 원문에 주어진 URL을 그대로 사용합니다."""
 
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mode: bool = False) -> str:
@@ -220,7 +228,7 @@ def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mod
             {"role": "user", "content": user},
         ],
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=8192,
         top_p=0.9,
     )
     if json_mode:
@@ -242,7 +250,9 @@ def summarize_with_groq(news_text: str) -> dict:
     """뉴스 요약 - 검증/재시도/강제치환 3중 안전장치 + JSON 구조화 출력"""
     client = Groq(api_key=GROQ_API_KEY)
 
-    user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다. 지정된 JSON 형식으로만 응답하세요.
+    article_count = news_text.count("\n- ") + (1 if news_text.startswith("- ") else 0)
+    user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다. 총 {article_count}개 기사가 있습니다.
+지정된 JSON 형식으로만 응답하세요. main+tech+global 합계는 {article_count}개(동일 사건 병합 제외 시) 이상이어야 합니다.
 
 [뉴스 원문]
 {news_text}
@@ -315,11 +325,17 @@ def build_email_html(categories: dict, today: str) -> str:
         for i, article in enumerate(articles, 1):
             title = html.escape(article.get("title", ""))
             summary = html.escape(article.get("summary", ""))
+            insight = html.escape(article.get("insight", ""))
             link = html.escape(article.get("link", "#"), quote=True)
+            insight_html = f"""
+          <div style="font-size:12px; color:#6b7280; font-weight:700; margin-bottom:4px;">💡 왜 중요한가</div>
+          <div style="font-size:13px; color:#333333; line-height:1.6; margin-bottom:10px; padding:10px 12px; background:#f9fafb; border-left:3px solid {color}; border-radius:4px;">{insight}</div>
+            """ if insight else ""
             section_html += f"""
         <tr><td style="padding:16px 20px; border-bottom:1px solid #eeeeee;">
           <div style="font-size:15px; font-weight:600; color:#111111; margin-bottom:6px;">{i}. {title}</div>
           <div style="font-size:13px; color:#444444; line-height:1.6; margin-bottom:10px;">{summary}</div>
+          {insight_html}
           <a href="{link}" style="display:inline-block; font-size:12px; color:#ffffff; background:{color}; padding:6px 14px; border-radius:4px; text-decoration:none;">기사 보기 →</a>
         </td></tr>
             """
