@@ -173,11 +173,28 @@ def force_replace_hanja(text: str) -> str:
 # 여러 섹션에 배치되는 경우, 제목 문자열 자체가 다르면 fetch 단계의
 # SequenceMatcher로는 못 걸러지므로 토큰(단어) 유사도로 한 번 더 걸러낸다)
 # ─────────────────────────────────────────────
+# 흔한 한국어 조사. 긴 것부터 매칭해야 "에서"가 "서"보다 먼저 걸린다.
+_PARTICLE_SUFFIXES = sorted([
+    "으로는", "에서는", "이라는", "라는", "에게서", "에서", "으로", "부터", "까지",
+    "에게", "이나", "만큼", "처럼", "은", "는", "이", "가", "을", "를", "의",
+    "에", "로", "와", "과", "도", "만",
+], key=len, reverse=True)
+
+
+def _strip_particle(word: str) -> str:
+    """단어 끝의 조사를 제거해 "삼성전자"와 "삼성전자는"을 같은 토큰으로 취급한다."""
+    for suf in _PARTICLE_SUFFIXES:
+        if word.endswith(suf) and len(word) > len(suf):
+            return word[:-len(suf)]
+    return word
+
+
 def _tokenize(title: str) -> set:
-    return set(re.findall(r'[가-힣a-zA-Z0-9]+', title))
+    words = re.findall(r'[가-힣a-zA-Z0-9]+', title)
+    return {_strip_particle(w) for w in words}
 
 
-def dedupe_across_categories(categories: dict, threshold: float = 0.55, min_overlap: int = 2) -> dict:
+def dedupe_across_categories(categories: dict, threshold: float = 0.5, min_overlap: int = 2) -> dict:
     """우선순위(main > tech > global)가 높은 카테고리에 이미 실린 사건은 이후 카테고리에서 제외.
 
     유사도는 Dice 계수(2*교집합 / (|A|+|B|))로 계산한다. Jaccard(교집합/합집합)는
@@ -188,7 +205,11 @@ def dedupe_across_categories(categories: dict, threshold: float = 0.55, min_over
     별도 기사 처리됨). Dice는 같은 경우 0.706으로 정확히 중복 판정하면서도, 짧은 제목이
     완전히 다른 내용의 긴 제목에 부분 포함되는 경우는 여전히 낮게 나와 오탐(false
     positive)을 막아준다. min_overlap(최소 겹치는 단어 수)은 "AI", "인공지능" 같은
-    단어 하나만 겹치는 무관한 기사가 중복으로 잡히지 않도록 하는 안전판이다."""
+    단어 하나만 겹치는 무관한 기사가 중복으로 잡히지 않도록 하는 안전판이다.
+
+    추가로 _tokenize에서 조사를 제거한다. "삼성전자는"과 "삼성전자"가 조사 때문에
+    다른 토큰으로 잡혀 같은 리포트를 다룬 기사(예: "60만전자" 관련 3건)가 유사도를
+    낮게 계산해 병합되지 못하는 사례가 있었다."""
     kept_tokens = []
     result = {key: [] for key, _, _ in CATEGORY_META}
     for key, _, _ in CATEGORY_META:
