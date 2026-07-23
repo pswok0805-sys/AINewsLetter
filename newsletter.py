@@ -177,10 +177,18 @@ def _tokenize(title: str) -> set:
     return set(re.findall(r'[가-힣a-zA-Z0-9]+', title))
 
 
-def dedupe_across_categories(categories: dict, threshold: float = 0.6, min_overlap: int = 2) -> dict:
+def dedupe_across_categories(categories: dict, threshold: float = 0.55, min_overlap: int = 2) -> dict:
     """우선순위(main > tech > global)가 높은 카테고리에 이미 실린 사건은 이후 카테고리에서 제외.
-    "AI", "인공지능" 같은 공통 단어 한두 개만 겹쳐도 중복으로 오판하지 않도록
-    Jaccard 임계값(0.6)과 최소 겹치는 단어 수(2개) 조건을 함께 요구한다."""
+
+    유사도는 Dice 계수(2*교집합 / (|A|+|B|))로 계산한다. Jaccard(교집합/합집합)는
+    한쪽 제목에만 붙은 수식어("현실화되나", "분석" 등)가 분모를 불려, 같은 사건을
+    다룬 기사인데도 핵심 단어가 다 겹쳐도 임계값을 못 넘기는 오탐(false negative)이
+    실제로 발생했다(예: "KB증권, 삼성전자 구글 AI 최대 수혜주 분석" vs "KB증권 삼성전자
+    구글 AI 투자 확대 최대 수혜주" — 핵심 단어 6개가 겹치지만 Jaccard=0.545 < 0.6으로
+    별도 기사 처리됨). Dice는 같은 경우 0.706으로 정확히 중복 판정하면서도, 짧은 제목이
+    완전히 다른 내용의 긴 제목에 부분 포함되는 경우는 여전히 낮게 나와 오탐(false
+    positive)을 막아준다. min_overlap(최소 겹치는 단어 수)은 "AI", "인공지능" 같은
+    단어 하나만 겹치는 무관한 기사가 중복으로 잡히지 않도록 하는 안전판이다."""
     kept_tokens = []
     result = {key: [] for key, _, _ in CATEGORY_META}
     for key, _, _ in CATEGORY_META:
@@ -189,7 +197,7 @@ def dedupe_across_categories(categories: dict, threshold: float = 0.6, min_overl
             is_dup = any(
                 tokens and kt
                 and len(tokens & kt) >= min_overlap
-                and len(tokens & kt) / len(tokens | kt) >= threshold
+                and (2 * len(tokens & kt)) / (len(tokens) + len(kt)) >= threshold
                 for kt in kept_tokens
             )
             if is_dup:
