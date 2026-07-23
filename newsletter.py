@@ -231,7 +231,7 @@ SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
 - 두 기사를 병합한 경우 id는 그중 더 정보가 풍부한 기사 하나의 id를 사용합니다."""
 
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 
 def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mode: bool = False) -> str:
