@@ -238,8 +238,8 @@ SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
 
 [절대 규칙 - 편집]
 - "병합"은 두 기사가 완전히 동일한 사건(예: 같은 회사의 같은 발표, 같은 날 같은 계약)을 다른 매체가 보도한 경우에만 적용합니다. 같은 산업/주제(예: "AI 반도체")를 다루더라도 회사·발표·사건이 다르면 절대 병합하지 말고 각각 별도 항목으로 유지합니다. 예를 들어 "AMD의 HBM4 채택" 기사와 "구글의 자체 AI 칩 개발" 기사는 둘 다 반도체 관련이지만 서로 다른 사건이므로 반드시 별도 항목입니다.
-- [뉴스 원문]에 있는 기사 수가 9개 이상이면, 최종 출력(main+tech+global 합계)도 반드시 9개 이상을 포함해야 합니다. 기사 수가 9개 미만이면 원문에 있는 기사 수만큼 전부 포함합니다. 병합은 정말로 동일 사건일 때만 예외적으로 적용하고, 임의로 기사 수를 줄이지 않습니다.
-- "주요 뉴스"는 게재 순서가 아니라 산업/기술적 파급력, 독점성, 최초성을 기준으로 직접 판단해 선정합니다. 단순 보도자료성 뉴스(윤리 헌장 제정 등)는 실질적 파급력이 없으면 주요 뉴스에서 제외하되, tech 또는 global 섹션으로는 반드시 포함시킵니다.
+- main, tech, global 각 섹션은 정확히 3개씩, 총 9개 기사를 출력합니다. 병합으로 한 섹션의 후보가 3개 미만이 되면, 다른 섹션에 배정할 기사를 해당 섹션으로 재분류해서라도 반드시 3개를 채웁니다. 원문 기사 수가 9개 미만인 경우에만 예외적으로 부족한 수만큼 출력합니다.
+- "주요 뉴스"(main)는 게재 순서가 아니라 산업/기술적 파급력, 독점성, 최초성을 기준으로 직접 판단해 상위 3개를 선정합니다. tech와 global도 각각 그 안에서 중요도 상위 3개를 선정합니다. 단순 보도자료성 뉴스(윤리 헌장 제정 등)는 실질적 파급력이 없으면 main에서 제외하되, tech 또는 global 섹션에는 포함시켜 3개를 채우는 데 사용할 수 있습니다.
 - 요약에는 다음과 같은 상투적 문구를 사용하지 않습니다: "~에 큰 영향을 미칠 수 있습니다", "~에 영향을 미칠 것으로 보입니다", "주목할 만합니다", "관심이 집중되고 있습니다".
 
 [요약 구성 - summary와 insight를 반드시 구분]
@@ -256,11 +256,18 @@ SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
   "global": [ {"id": 0, "title": "...", "summary": "...", "insight": "..."} ]
 }
 
-- main은 최대 3개, 나머지는 원문 기사 수에 맞춰 tech/global에 배분합니다(전체 합계는 원문 기사 수 이상 줄이지 않습니다).
+- main, tech, global 각각 정확히 3개씩(원문 기사 수가 9개 미만이면 가능한 만큼) 채웁니다.
 - 두 기사를 병합한 경우 id는 그중 더 정보가 풍부한 기사 하나의 id를 사용합니다."""
 
 
 GROQ_MODEL = "openai/gpt-oss-120b"
+
+# gpt-oss 계열은 답변 전에 내부 추론(analysis)을 거치는 reasoning 모델이라,
+# JSON 강제 모드와 같이 쓰면 추론 텍스트가 content에 섞여 들어가 응답이
+# JSON 스키마를 깨는 경우가 있다(Groq가 400 json_validate_failed로 거부).
+# reasoning_format="hidden"으로 추론 내용을 완전히 숨기면 이 문제가 없어진다.
+# llama 등 비-reasoning 모델에는 이 파라미터가 없으므로 목록에 있을 때만 붙인다.
+REASONING_MODELS = {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}
 
 
 def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mode: bool = False) -> str:
@@ -277,6 +284,8 @@ def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mod
     )
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
+    if GROQ_MODEL in REASONING_MODELS:
+        kwargs["reasoning_format"] = "hidden"
     response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
@@ -300,8 +309,9 @@ def summarize_with_groq(articles: list[dict]) -> dict:
         f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
         for a in articles
     )
+    target_per_category = min(3, article_count)
     user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다. 총 {article_count}개 기사가 있습니다.
-지정된 JSON 형식으로만 응답하세요. main+tech+global 합계는 {article_count}개(동일 사건 병합 제외 시) 이상이어야 합니다.
+지정된 JSON 형식으로만 응답하세요. main, tech, global 각각 정확히 {target_per_category}개씩(총 {target_per_category * 3}개)을 채우세요.
 
 [뉴스 원문]
 {news_lines}
@@ -346,6 +356,7 @@ JSON 키(id/title/summary/insight)와 구조는 그대로 유지하고, 문자�
 
     for key, _, _ in CATEGORY_META:
         data.setdefault(key, [])
+        data[key] = data[key][:3]  # LLM이 지시보다 많이 보낸 경우에 대한 안전장치
 
     link_by_id = {a["id"]: a["link"] for a in articles}
     for key, _, _ in CATEGORY_META:
