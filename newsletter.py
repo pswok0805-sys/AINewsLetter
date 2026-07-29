@@ -210,6 +210,8 @@ def dedupe_across_categories(categories: dict, threshold: float = 0.5, min_overl
     추가로 _tokenize에서 조사를 제거한다. "삼성전자는"과 "삼성전자"가 조사 때문에
     다른 토큰으로 잡혀 같은 리포트를 다룬 기사(예: "60만전자" 관련 3건)가 유사도를
     낮게 계산해 병합되지 못하는 사례가 있었다."""
+    before_counts = {key: len(categories.get(key, [])) for key, _, _ in CATEGORY_META}
+
     kept_tokens = []
     result = {key: [] for key, _, _ in CATEGORY_META}
     for key, _, _ in CATEGORY_META:
@@ -225,6 +227,13 @@ def dedupe_across_categories(categories: dict, threshold: float = 0.5, min_overl
                 continue
             kept_tokens.append(tokens)
             result[key].append(article)
+
+    after_counts = {key: len(result[key]) for key, _, _ in CATEGORY_META}
+    before_str = "/".join(str(before_counts[key]) for key, _, _ in CATEGORY_META)
+    after_str = "/".join(str(after_counts[key]) for key, _, _ in CATEGORY_META)
+    removed = sum(before_counts.values()) - sum(after_counts.values())
+    print(f"🔍 dedup 전(main/tech/global)={before_str} → dedup 후={after_str} ({removed}개 제거)")
+
     return result
 
 
