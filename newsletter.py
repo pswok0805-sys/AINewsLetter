@@ -308,6 +308,65 @@ def _extract_json_object(text: str) -> str:
     return text[start:end + 1]
 
 
+def _used_ids(data: dict) -> set:
+    return {item.get("id") for key, _, _ in CATEGORY_META for item in data.get(key, [])}
+
+
+def _fill_shortfall_via_llm(client, data: dict, remaining: list[dict], target: int) -> dict:
+    """1차 응답이 목표 개수(main/tech/global 각 target개)를 못 채운 경우, 아직
+    사용되지 않은 기사만 대상으로 부족한 섹션을 채우도록 한 번 더 요청한다.
+    LLM에게 "골라서" 채우게 하는 시도이므로, 이번에도 부족할 수 있다 —
+    최종 보장은 _fill_shortfall_mechanically가 맡는다."""
+    need_desc = ", ".join(
+        f"{key}에 {target - len(data[key])}개" for key, _, _ in CATEGORY_META if len(data[key]) < target
+    )
+    remaining_lines = "\n".join(
+        f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
+        for a in remaining
+    )
+    fix_prompt = f"""직전 응답에서 다음 섹션이 목표 개수를 채우지 못했습니다: {need_desc}.
+아래는 아직 사용되지 않은 기사 목록입니다. 이 기사들만 사용해서 부족한 섹션을 채우세요.
+이미 채워진 섹션은 다시 출력하지 말고, 부족한 섹션만 JSON으로 출력하세요.
+
+[사용 가능한 기사]
+{remaining_lines}
+
+[출력 형식]
+부족한 섹션 키만 포함한 JSON 객체. 예: {{"global": [ {{"id": 0, "title": "...", "summary": "...", "insight": "..."}} ]}}
+"""
+    try:
+        result = call_groq(client, SYSTEM_PROMPT, fix_prompt, temperature=0.2, json_mode=True)
+        extra = json.loads(_extract_json_object(result))
+    except Exception as e:
+        print(f"⚠️ 보충 요청 실패, 기계적 보충으로 넘어감: {e}")
+        return data
+
+    for key, _, _ in CATEGORY_META:
+        for item in extra.get(key, []):
+            if len(data[key]) < target:
+                data[key].append(item)
+    return data
+
+
+def _fill_shortfall_mechanically(data: dict, remaining: list[dict], target: int) -> dict:
+    """LLM 보충 요청으로도 부족분이 채워지지 않으면, 남은 기사를 순서대로
+    부족한 섹션에 기계적으로 배정해 최소 개수(target)를 확정 보장한다.
+    이 기사들은 LLM이 요약하지 않았으므로 summary는 제목 기반 안내문으로,
+    insight는 빈 값으로 둔다(HTML에서는 insight가 없으면 해당 박스가 생략된다)."""
+    idx = 0
+    for key, _, _ in CATEGORY_META:
+        while len(data[key]) < target and idx < len(remaining):
+            a = remaining[idx]
+            idx += 1
+            data[key].append({
+                "id": a["id"],
+                "title": a["title"],
+                "summary": f"[자동 보충] {a['title']} 관련 기사입니다. 자세한 내용은 원문을 확인해주세요.",
+                "insight": "",
+            })
+    return data
+
+
 def summarize_with_groq(articles: list[dict]) -> dict:
     """뉴스 요약 - 검증/재시도/강제치환 3중 안전장치 + JSON 구조화 출력.
     링크는 프롬프트에 넣지 않고 id로만 참조시켜 토큰(TPM) 사용량을 줄인다."""
@@ -365,14 +424,34 @@ JSON 키(id/title/summary/insight)와 구조는 그대로 유지하고, 문자�
 
     for key, _, _ in CATEGORY_META:
         data.setdefault(key, [])
-        data[key] = data[key][:3]  # LLM이 지시보다 많이 보낸 경우에 대한 안전장치
+        data[key] = data[key][:target_per_category]  # LLM이 지시보다 많이 보낸 경우에 대한 안전장치
+
+    # dedup을 부족분 보충보다 먼저 실행한다. 순서가 반대이면 보충으로 채운
+    # 기사를 dedup이 다시 잘라내 개수 보장이 깨질 수 있다.
+    data = dedupe_across_categories(data)
+
+    shortfall = {key: target_per_category - len(data[key]) for key, _, _ in CATEGORY_META}
+    if any(v > 0 for v in shortfall.values()):
+        remaining = [a for a in articles if a["id"] not in _used_ids(data)]
+        print(f"⚠️ 카테고리 부족 감지 {shortfall} → LLM 보충 요청 (남은 기사 {len(remaining)}개)")
+        if remaining:
+            data = _fill_shortfall_via_llm(client, data, remaining, target_per_category)
+
+        still_short = any(len(data[key]) < target_per_category for key, _, _ in CATEGORY_META)
+        if still_short:
+            remaining = [a for a in articles if a["id"] not in _used_ids(data)]
+            print(f"⚠️ 보충 요청 후에도 부족 → 기계적 보충 적용 (남은 기사 {len(remaining)}개)")
+            data = _fill_shortfall_mechanically(data, remaining, target_per_category)
+
+    final_counts = "/".join(str(len(data[key])) for key, _, _ in CATEGORY_META)
+    print(f"📊 최종 카테고리별 기사 수(main/tech/global)={final_counts}")
 
     link_by_id = {a["id"]: a["link"] for a in articles}
     for key, _, _ in CATEGORY_META:
         for item in data[key]:
             item["link"] = link_by_id.get(item.get("id"), "")
 
-    return dedupe_across_categories(data)
+    return data
 
 
 def decode_links_in_categories(categories: dict) -> dict:
