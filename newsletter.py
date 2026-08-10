@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+import time
 import requests
 import xml.etree.ElementTree as ET
 import smtplib
@@ -63,6 +64,11 @@ def decode_google_news_link(link: str) -> str:
 
 MAX_ARTICLES = 12
 
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebkit/537.36 (KHTML, like Gecko) "
+                  "Chrome/122.0.0.0 Safari/537.36",
+}
 
 def fetch_ai_news() -> list[dict]:
     """구글 뉴스 RSS에서 AI 관련 기사 수집.
@@ -90,8 +96,15 @@ def fetch_ai_news() -> list[dict]:
 
     for url in feeds:
         try:
-            res = requests.get(url, timeout=10)
-            root = ET.fromstring(res.content)
+            res = requests.get(url, headers=REQUEST_HEADERS, timeout=10)
+            try:
+                root = ET.fromstring(res.content)
+            except ET.ParseError as pe:
+                # XML 파싱 실패 = RSS가 아닌 응답(HTML 차단 페이지 등)을 받은 경우.
+                # 다음 진단을 위해 상태 코드와 응답 앞부분을 남긴다.
+                snippet = res.text[:200].replace("\n", " ")
+                print(f"뉴스 수집 오류(XML 파싱 실패, status={res.status_code}): {pe} | 응답앞부분: {snippet}")
+                continue
             for item in root.findall(".//item")[:5]:
                 title = item.findtext("title", "")
                 link = item.findtext("link", "")
@@ -546,12 +559,44 @@ def send_failure_notice(error: Exception):
         server.sendmail(GMAIL_USER, recipients, msg.as_string())
 
 
+def is_empty_newsletter(categories: dict) -> bool:
+    """세 카테고리 모두 비어 있으면 True (내보낼 기사가 하나도 없음)"""
+    return not any(categories.get(key) for key, _, _ in CATEGORY_META)
+
+
+FETCH_MAX_ATTEMPTS = 3
+FETCH_RETRY_WAIT_SEC = 60
+
+
+def build_newsletter() -> dict:
+    """뉴스 수집 → 요약을 수행한다. 결과가 완전히 비면(수집 0개 또는 요약 결과 없음)
+    구글 뉴스 일시 차단 등 일시적 원인일 수 있으므로, 잠시 기다렸다 다시 수집한다.
+    상한(FETCH_MAX_ATTEMPTS)까지 시도해도 비면 마지막 빈 결과를 그대로 반환한다."""
+    summary = {}
+    for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+        print(f"뉴스 수집 중... (시도 {attempt}/{FETCH_MAX_ATTEMPTS})")
+        news = fetch_ai_news()
+        if news:
+            print("Groq 요약 중...")
+            summary = summarize_with_groq(news)
+            if not is_empty_newsletter(summary):
+                return summary
+            print("⚠️ 요약 결과가 비어 있음")
+        else:
+            print("⚠️ 수집된 기사가 0개")
+
+        if attempt < FETCH_MAX_ATTEMPTS:
+            print(f"⏳ {FETCH_RETRY_WAIT_SEC}초 대기 후 재수집")
+            time.sleep(FETCH_RETRY_WAIT_SEC)
+    return summary
+
+
 if __name__ == "__main__":
     try:
-        print("뉴스 수집 중...")
-        news = fetch_ai_news()
-        print("Groq 요약 중...")
-        summary = summarize_with_groq(news)
+        summary = build_newsletter()
+        if is_empty_newsletter(summary):
+            # 재수집을 모두 시도해도 비었을 때만 실패 안내. 빈 뉴스레터는 발송하지 않는다.
+            raise RuntimeError(f"{FETCH_MAX_ATTEMPTS}회 재수집에도 기사를 확보하지 못했습니다.")
         print("원문 링크 디코딩 중...")
         summary = decode_links_in_categories(summary)
         print("이메일 전송 중...")
