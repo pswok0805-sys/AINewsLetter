@@ -62,13 +62,62 @@ def decode_google_news_link(link: str) -> str:
     return link
 
 
+# 본문 리드에서 뽑아낼 최대 글자 수. gpt-oss-120b의 무료 TPM 한도가 8,000으로
+# 빠듯해, 리드 12개 + 시스템 프롬프트 + 출력이 한도를 넘지 않도록 짧게 유지한다.
+LEAD_MAX_CHARS = 200
+
+
+def fetch_article_lead(url: str) -> str:
+    """기사 원문 URL에서 핵심 리드 문장을 추출한다.
+    LLM이 제목만 보고 날짜·수치를 지어내는 문제를 막기 위한 사실 근거로 쓴다.
+    별도 파서 라이브러리 없이, 신문사가 공통으로 넣는 메타 설명(og:description,
+    meta description)을 정규식으로 뽑는다. 실패하면 빈 문자열을 반환한다."""
+    if not url:
+        return ""
+    try:
+        res = requests.get(url, headers=REQUEST_HEADERS, timeout=10)
+        html_text = res.text
+    except Exception as e:
+        print(f"본문 수집 오류: {e}")
+        return ""
+
+    # og:description 우선, 없으면 일반 meta description
+    for pattern in (
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pattern, html_text, re.IGNORECASE)
+        if m:
+            lead = html.unescape(m.group(1)).strip()
+            return lead[:LEAD_MAX_CHARS]
+    return ""
+
+
+def enrich_articles(articles: list[dict]) -> list[dict]:
+    """수집 기사의 구글 뉴스 링크를 실제 원문 URL로 디코딩하고, 본문 리드를 채운다.
+    리드는 LLM이 제목만 보고 날짜·수치를 지어내는 것을 막는 사실 근거로 쓰인다.
+    링크가 여기서 실제 URL로 교체되므로, 이후 별도 디코딩 단계는 필요 없다."""
+    lead_ok = 0
+    for a in articles:
+        a["link"] = decode_google_news_link(a["link"])
+        a["lead"] = fetch_article_lead(a["link"])
+        if a["lead"]:
+            lead_ok += 1
+    print(f"본문 리드 확보: {lead_ok}/{len(articles)}개")
+    return articles
+
+
 MAX_ARTICLES = 12
 
+# 구글 뉴스는 User-Agent 없이 요청하면 봇으로 판단해 RSS(XML) 대신 차단/에러
+# 페이지(HTML)를 돌려줄 수 있다. 그 경우 XML 파서가 "not well-formed" 에러로
+# 죽어 기사 수집이 0개가 된다(실제 발생). 브라우저 UA를 붙여 이를 회피한다.
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebkit/537.36 (KHTML, like Gecko) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/122.0.0.0 Safari/537.36",
 }
+
 
 def fetch_ai_news() -> list[dict]:
     """구글 뉴스 RSS에서 AI 관련 기사 수집.
@@ -264,9 +313,14 @@ SYSTEM_PROMPT = """당신은 한국어 AI 뉴스레터 에디터입니다.
 - "주요 뉴스"(main)는 게재 순서가 아니라 산업/기술적 파급력, 독점성, 최초성을 기준으로 직접 판단해 상위 3개를 선정합니다. tech와 global도 각각 그 안에서 중요도 상위 3개를 선정합니다. 단순 보도자료성 뉴스(윤리 헌장 제정 등)는 실질적 파급력이 없으면 main에서 제외하되, tech 또는 global 섹션에는 포함시켜 3개를 채우는 데 사용할 수 있습니다.
 - 요약에는 다음과 같은 상투적 문구를 사용하지 않습니다: "~에 큰 영향을 미칠 수 있습니다", "~에 영향을 미칠 것으로 보입니다", "주목할 만합니다", "관심이 집중되고 있습니다".
 
+[절대 규칙 - 사실 근거 (매우 중요)]
+- 각 기사에는 "본문요약"이 함께 제공될 수 있습니다. summary와 insight는 오직 제목과 본문요약에 명시된 사실만 근거로 작성합니다.
+- 제목과 본문요약에 없는 구체적 날짜, 연도, 금액, 수치, 계약 시점, 인물명은 절대 지어내지 마십시오. 없으면 쓰지 않습니다. 특히 "2024년", "3월에 체결" 같은 날짜를 추측해서 넣는 것은 금지입니다.
+- 본문요약이 제공되지 않은 기사는 제목에서 확인되는 사실만으로 간결히 작성하고, 확인 불가능한 세부는 "자세한 내용은 원문 참고"로 안내합니다.
+
 [요약 구성 - summary와 insight를 반드시 구분]
-- summary: 기사의 핵심 사실만 3~4문장으로 설명합니다. 누가, 무엇을, 언제, 얼마나(수치/일정)를 포함한 사실 위주 설명이며 해석은 넣지 않습니다.
-- insight: 이 뉴스를 읽는 독자가 생각해봐야 할 함의를 3~4문장으로 씁니다. 다음 중 최소 2가지를 포함합니다: (1) 이 사건이 경쟁사/업계 구도를 어떻게 바꾸는지 구체적 비교, (2) 왜 지금 이 시점에 일어났는지 배경, (3) 단기(수개월)와 중장기(1~2년) 전망의 차이, (4) 독자(개발자/투자자/일반 소비자 등)에게 실질적으로 달라지는 점. insight는 summary의 문장을 재진술하지 않고 반드시 새로운 관점을 추가합니다.
+- summary: 제목과 본문요약에 나온 핵심 사실만 3~4문장으로 설명합니다. 사실 위주로 쓰며 해석은 넣지 않습니다. 날짜·수치는 본문요약에 실제로 있을 때만 포함하고, 없으면 억지로 넣지 않습니다.
+- insight: 이 뉴스를 읽는 독자가 생각해봐야 할 함의를 3~4문장으로 씁니다. 다음 중 최소 2가지를 포함합니다: (1) 이 사건이 경쟁사/업계 구도를 어떻게 바꾸는지 구체적 비교, (2) 왜 지금 이 시점에 일어났는지 배경, (3) 단기(수개월)와 중장기(1~2년) 전망의 차이, (4) 독자(개발자/투자자/일반 소비자 등)에게 실질적으로 달라지는 점. insight는 summary의 문장을 재진술하지 않고 반드시 새로운 관점을 추가하되, 근거 없는 구체적 수치·날짜는 지어내지 않습니다.
 
 [출력 형식 - 절대 규칙]
 - 아래 JSON 스키마 외의 텍스트(설명, 코드블록 표시 등)는 절대 출력하지 않습니다. 순수 JSON 객체 하나만 출력합니다.
@@ -333,10 +387,11 @@ def _fill_shortfall_via_llm(client, data: dict, remaining: list[dict], target: i
     need_desc = ", ".join(
         f"{key}에 {target - len(data[key])}개" for key, _, _ in CATEGORY_META if len(data[key]) < target
     )
-    remaining_lines = "\n".join(
-        f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
-        for a in remaining
-    )
+    def _fmt(a):
+        head = f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
+        lead = a.get("lead")
+        return f"{head}\n  본문요약: {lead}" if lead else head
+    remaining_lines = "\n".join(_fmt(a) for a in remaining)
     fix_prompt = f"""직전 응답에서 다음 섹션이 목표 개수를 채우지 못했습니다: {need_desc}.
 아래는 아직 사용되지 않은 기사 목록입니다. 이 기사들만 사용해서 부족한 섹션을 채우세요.
 이미 채워진 섹션은 다시 출력하지 말고, 부족한 섹션만 JSON으로 출력하세요.
@@ -371,10 +426,12 @@ def _fill_shortfall_mechanically(data: dict, remaining: list[dict], target: int)
         while len(data[key]) < target and idx < len(remaining):
             a = remaining[idx]
             idx += 1
+            # 리드가 있으면 그 사실만 그대로 쓰고(지어내기 없음), 없으면 원문 안내로 대체
+            summary = a.get("lead") or f"{a['title']} 관련 기사입니다. 자세한 내용은 원문을 확인해주세요."
             data[key].append({
                 "id": a["id"],
                 "title": a["title"],
-                "summary": f"[자동 보충] {a['title']} 관련 기사입니다. 자세한 내용은 원문을 확인해주세요.",
+                "summary": summary,
                 "insight": "",
             })
     return data
@@ -386,10 +443,11 @@ def summarize_with_groq(articles: list[dict]) -> dict:
     client = Groq(api_key=GROQ_API_KEY)
 
     article_count = len(articles)
-    news_lines = "\n".join(
-        f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
-        for a in articles
-    )
+    def _fmt(a):
+        head = f"- id={a['id']} [{a['source']}] {a['title']}" if a["source"] else f"- id={a['id']} {a['title']}"
+        lead = a.get("lead")
+        return f"{head}\n  본문요약: {lead}" if lead else head
+    news_lines = "\n".join(_fmt(a) for a in articles)
     target_per_category = min(3, article_count)
     user_prompt = f"""다음은 오늘의 AI 관련 뉴스 목록입니다. 총 {article_count}개 기사가 있습니다.
 지정된 JSON 형식으로만 응답하세요. main, tech, global 각각 정확히 {target_per_category}개씩(총 {target_per_category * 3}개)을 채우세요.
@@ -465,16 +523,6 @@ JSON 키(id/title/summary/insight)와 구조는 그대로 유지하고, 문자�
             item["link"] = link_by_id.get(item.get("id"), "")
 
     return data
-
-
-def decode_links_in_categories(categories: dict) -> dict:
-    """최종 게재 대상 기사(보통 10개 이하)에 한해 구글 뉴스 링크를 원문 URL로 디코딩.
-    전체 수집 단계(최대 12개)에서 디코딩하면 무료 API 호출량이 과도해지므로
-    요약·중복 제거가 끝난 뒤 이 시점에만 수행한다."""
-    for key, _, _ in CATEGORY_META:
-        for article in categories.get(key, []):
-            article["link"] = decode_google_news_link(article.get("link", ""))
-    return categories
 
 
 def build_email_html(categories: dict, today: str) -> str:
@@ -577,6 +625,8 @@ def build_newsletter() -> dict:
         print(f"뉴스 수집 중... (시도 {attempt}/{FETCH_MAX_ATTEMPTS})")
         news = fetch_ai_news()
         if news:
+            print("링크 디코딩 및 본문 리드 수집 중...")
+            news = enrich_articles(news)
             print("Groq 요약 중...")
             summary = summarize_with_groq(news)
             if not is_empty_newsletter(summary):
@@ -597,8 +647,6 @@ if __name__ == "__main__":
         if is_empty_newsletter(summary):
             # 재수집을 모두 시도해도 비었을 때만 실패 안내. 빈 뉴스레터는 발송하지 않는다.
             raise RuntimeError(f"{FETCH_MAX_ATTEMPTS}회 재수집에도 기사를 확보하지 못했습니다.")
-        print("원문 링크 디코딩 중...")
-        summary = decode_links_in_categories(summary)
         print("이메일 전송 중...")
         send_email(summary)
     except Exception as e:
