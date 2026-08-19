@@ -345,25 +345,53 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 # llama 등 비-reasoning 모델에는 이 파라미터가 없으므로 목록에 있을 때만 붙인다.
 REASONING_MODELS = {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}
 
+API_MAX_ATTEMPTS = 3
+API_RETRY_WAIT_SEC = 20
 
-def call_groq(client, system: str, user: str, temperature: float = 0.2, json_mode: bool = False) -> str:
-    """Groq API 호출 래퍼 - 일관된 파라미터 적용"""
-    kwargs = dict(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=temperature,
-        max_tokens=4096,
-        top_p=0.9,
-    )
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-    if GROQ_MODEL in REASONING_MODELS:
-        kwargs["reasoning_format"] = "hidden"
-    response = client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content
+
+def call_groq(client, system: str, user: str, temperature: float = 0.2,
+              json_mode: bool = False, max_tokens: int = 4096) -> str:
+    """Groq API 호출 래퍼 - 일관된 파라미터 적용 + API 오류 재시도.
+
+    Groq 호출은 일시적 오류(429 rate limit, 5xx)와 400 json_validate_failed
+    (JSON 모드에서 응답이 스키마를 만족하지 못하면 Groq가 거부하고 content를
+    버린다)로 실패할 수 있다. 이전에는 이런 예외가 그대로 위로 전파되어 재수집
+    루프를 건너뛰고 파이프라인이 즉시 죽었다(실제로 이틀 연속 발송 실패).
+
+    주의: max_tokens를 키우는 방식으로는 재시도하지 않는다. Groq의 TPM(분당 토큰)
+    한도는 입력과 max_tokens를 합산해 계산하므로, 늘리면 413(요청 과대)으로
+    바뀔 뿐이다. 여기서는 동일 조건으로 재시도해 일시적 오류를 흡수하고,
+    호출자(build_newsletter)가 상위 단계에서 다시 시도하도록 예외를 넘긴다."""
+    last_error = None
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        kwargs = dict(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=0.9,
+        )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        if GROQ_MODEL in REASONING_MODELS:
+            kwargs["reasoning_format"] = "hidden"
+        try:
+            response = client.chat.completions.create(**kwargs)
+            content = response.choices[0].message.content
+            if content:
+                return content
+            last_error = RuntimeError("빈 응답(content=None)")
+        except Exception as e:
+            last_error = e
+
+        print(f"⚠️ Groq 호출 실패 (시도 {attempt}/{API_MAX_ATTEMPTS}, max_tokens={max_tokens}): {last_error}")
+        if attempt < API_MAX_ATTEMPTS:
+            time.sleep(API_RETRY_WAIT_SEC)
+
+    raise RuntimeError(f"Groq 호출이 {API_MAX_ATTEMPTS}회 모두 실패했습니다: {last_error}")
 
 
 def _extract_json_object(text: str) -> str:
@@ -617,28 +645,35 @@ FETCH_RETRY_WAIT_SEC = 60
 
 
 def build_newsletter() -> dict:
-    """뉴스 수집 → 요약을 수행한다. 결과가 완전히 비면(수집 0개 또는 요약 결과 없음)
-    구글 뉴스 일시 차단 등 일시적 원인일 수 있으므로, 잠시 기다렸다 다시 수집한다.
-    상한(FETCH_MAX_ATTEMPTS)까지 시도해도 비면 마지막 빈 결과를 그대로 반환한다."""
+    """뉴스 수집 → 요약을 수행한다. 결과가 완전히 비거나(수집 0개, 요약 결과 없음)
+    요약 단계에서 예외가 나도(Groq API 오류 등) 일시적 원인일 수 있으므로,
+    잠시 기다렸다 처음부터 다시 시도한다.
+    상한(FETCH_MAX_ATTEMPTS)까지 시도해도 실패하면 마지막 빈 결과를 반환한다."""
     summary = {}
     for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
         print(f"뉴스 수집 중... (시도 {attempt}/{FETCH_MAX_ATTEMPTS})")
-        news = fetch_ai_news()
-        if news:
-            print("링크 디코딩 및 본문 리드 수집 중...")
-            news = enrich_articles(news)
-            print("Groq 요약 중...")
-            summary = summarize_with_groq(news)
-            if not is_empty_newsletter(summary):
-                return summary
-            print("⚠️ 요약 결과가 비어 있음")
-        else:
-            print("⚠️ 수집된 기사가 0개")
+        try:
+            news = fetch_ai_news()
+            if news:
+                print("링크 디코딩 및 본문 리드 수집 중...")
+                news = enrich_articles(news)
+                print("Groq 요약 중...")
+                summary = summarize_with_groq(news)
+                if not is_empty_newsletter(summary):
+                    return summary
+                print("⚠️ 요약 결과가 비어 있음")
+            else:
+                print("⚠️ 수집된 기사가 0개")
+        except Exception as e:
+            # 요약/수집 중 예외도 재시도 대상. 예전에는 여기서 그대로 죽어
+            # 재시도 루프가 무의미했다.
+            print(f"⚠️ 시도 {attempt} 실패: {e}")
 
         if attempt < FETCH_MAX_ATTEMPTS:
-            print(f"⏳ {FETCH_RETRY_WAIT_SEC}초 대기 후 재수집")
+            print(f"⏳ {FETCH_RETRY_WAIT_SEC}초 대기 후 재시도")
             time.sleep(FETCH_RETRY_WAIT_SEC)
     return summary
+
 
 
 if __name__ == "__main__":
